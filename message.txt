@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+
+import os
+import subprocess
+import tempfile
+import traceback
+import tkinter as tk
+import tkinter.ttk as ttk
+from datetime import datetime
+from github import Github
+
+def clone_repo(repo_url, clone_dir):
+    """
+    Clone the repository into the given directory using `git clone`.
+    Raises an exception if the command fails.
+    """
+    os.makedirs(clone_dir, exist_ok=True)
+    result = subprocess.run(["git", "clone", repo_url], cwd=clone_dir, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise Exception(f"Git clone failed:\nSTDOUT: {result.stdout}\nSTDERR: {result.stderr}")
+
+def list_files_in_repo(repo_local_path):
+    """
+    Return a list of top-level files in the local repo folder.
+    (You could expand this to walk subdirectories if you want.)
+    """
+    items = []
+    for item in os.listdir(repo_local_path):
+        if item == ".git":
+            continue  # Skip the .git folder
+        full_path = os.path.join(repo_local_path, item)
+        if os.path.isfile(full_path):
+            items.append(item)
+    return items
+
+def backdate_commit(repo_path, filename, dt):
+    """
+    Perform a single commit in the local repo for the specified file,
+    with the author/committer date set to `dt` (a datetime object).
+
+    Now uses --allow-empty so you can commit even if nothing changed.
+    """
+    # Convert to Git-friendly date string, e.g. "Mon Jan 02 15:04:05 2023 +0000"
+    git_date_str = dt.strftime("%a %b %d %H:%M:%S %Y +0000")
+
+    # Stage the file
+    add_result = subprocess.run(["git", "add", filename],
+                                cwd=repo_path,
+                                capture_output=True, text=True)
+    if add_result.returncode != 0:
+        raise Exception(f"git add failed:\nSTDOUT: {add_result.stdout}\nSTDERR: {add_result.stderr}")
+
+    commit_message = f"Backdated commit for {filename} to {dt.isoformat()}"
+
+    # Environment for backdating
+    env = os.environ.copy()
+    env["GIT_AUTHOR_DATE"] = git_date_str
+    env["GIT_COMMITTER_DATE"] = git_date_str
+
+    # Commit with --allow-empty to avoid "nothing to commit" errors
+    commit_result = subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", commit_message],
+        cwd=repo_path,
+        env=env,
+        capture_output=True, text=True
+    )
+    if commit_result.returncode != 0:
+        raise Exception(f"git commit failed:\nSTDOUT: {commit_result.stdout}\nSTDERR: {commit_result.stderr}")
+
+def push_commits(repo_path, branch_name="main"):
+    """
+    Push the local commits to the remote on the specified branch.
+    Assumes 'origin' remote was created by git clone.
+    """
+    push_result = subprocess.run(["git", "push", "origin", branch_name],
+                                 cwd=repo_path,
+                                 capture_output=True, text=True)
+    if push_result.returncode != 0:
+        raise Exception(f"git push failed:\nSTDOUT: {push_result.stdout}\nSTDERR: {push_result.stderr}")
+
+class GitHubBackdateGUI(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("GitHub Backdate Commits (Single Error Box, Allow Empty Commits)")
+
+        # --- Variables ---
+        self.github_token_var = tk.StringVar()
+        self.local_clone_path = None
+        self.repo_files = []
+
+        # Date/time variables
+        now = datetime.now()
+        self.year_var = tk.IntVar(value=now.year)
+        self.month_var = tk.IntVar(value=now.month)
+        self.day_var = tk.IntVar(value=now.day)
+        self.hour_var = tk.IntVar(value=now.hour)
+        self.minute_var = tk.IntVar(value=now.minute)
+        self.second_var = tk.IntVar(value=now.second)
+
+        # PyGithub instance (will be set after token entry)
+        self.github_instance = None
+        self.user_repos = []
+
+        # --- Widgets ---
+        self.create_widgets()
+
+    def create_widgets(self):
+        # Frame for token
+        frm_token = ttk.Frame(self)
+        frm_token.pack(padx=10, pady=5, fill="x")
+
+        lbl_token = ttk.Label(frm_token, text="GitHub Token:")
+        lbl_token.pack(side="left")
+
+        # You can copy/paste your token directly here
+        ent_token = ttk.Entry(frm_token, textvariable=self.github_token_var, width=50)
+        ent_token.pack(side="left", padx=5)
+
+        btn_auth = ttk.Button(frm_token, text="Authenticate", command=self.on_authenticate)
+        btn_auth.pack(side="left", padx=5)
+
+        # Frame for repository list
+        frm_repos = ttk.Frame(self)
+        frm_repos.pack(padx=10, pady=5, fill="both", expand=True)
+
+        self.repo_listbox = tk.Listbox(
+            frm_repos,
+            height=6,
+            selectmode="SINGLE",
+            exportselection=False  # Keep selection even if focus changes
+        )
+        self.repo_listbox.pack(side="left", fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(frm_repos, orient="vertical", command=self.repo_listbox.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.repo_listbox.config(yscrollcommand=scrollbar.set)
+        self.repo_listbox.bind("<<ListboxSelect>>", self.on_repo_select)
+
+        # Frame for files
+        frm_files = ttk.Frame(self)
+        frm_files.pack(padx=10, pady=5, fill="both", expand=True)
+
+        self.files_listbox = tk.Listbox(
+            frm_files,
+            height=6,
+            selectmode="SINGLE",
+            exportselection=False
+        )
+        self.files_listbox.pack(side="left", fill="both", expand=True)
+
+        scrollbar_files = ttk.Scrollbar(frm_files, orient="vertical", command=self.files_listbox.yview)
+        scrollbar_files.pack(side="right", fill="y")
+        self.files_listbox.config(yscrollcommand=scrollbar_files.set)
+
+        # Frame for date/time spinboxes
+        frm_datetime = ttk.Frame(self)
+        frm_datetime.pack(padx=10, pady=5, fill="x")
+
+        # Year
+        lbl_year = ttk.Label(frm_datetime, text="Year:")
+        lbl_year.grid(row=0, column=0, sticky="e", padx=(0,5))
+        sb_year = ttk.Spinbox(frm_datetime, from_=1970, to_=2100, textvariable=self.year_var, width=5)
+        sb_year.grid(row=0, column=1, sticky="w")
+
+        # Month
+        lbl_month = ttk.Label(frm_datetime, text="Month:")
+        lbl_month.grid(row=0, column=2, sticky="e")
+        sb_month = ttk.Spinbox(frm_datetime, from_=1, to_=12, textvariable=self.month_var, width=3)
+        sb_month.grid(row=0, column=3, sticky="w")
+
+        # Day
+        lbl_day = ttk.Label(frm_datetime, text="Day:")
+        lbl_day.grid(row=0, column=4, sticky="e")
+        sb_day = ttk.Spinbox(frm_datetime, from_=1, to_=31, textvariable=self.day_var, width=3)
+        sb_day.grid(row=0, column=5, sticky="w")
+
+        # Hour
+        lbl_hour = ttk.Label(frm_datetime, text="Hour:")
+        lbl_hour.grid(row=1, column=0, sticky="e", padx=(0,5))
+        sb_hour = ttk.Spinbox(frm_datetime, from_=0, to_=23, textvariable=self.hour_var, width=3)
+        sb_hour.grid(row=1, column=1, sticky="w")
+
+        # Minute
+        lbl_minute = ttk.Label(frm_datetime, text="Minute:")
+        lbl_minute.grid(row=1, column=2, sticky="e")
+        sb_minute = ttk.Spinbox(frm_datetime, from_=0, to_=59, textvariable=self.minute_var, width=3)
+        sb_minute.grid(row=1, column=3, sticky="w")
+
+        # Second
+        lbl_second = ttk.Label(frm_datetime, text="Second:")
+        lbl_second.grid(row=1, column=4, sticky="e")
+        sb_second = ttk.Spinbox(frm_datetime, from_=0, to_=59, textvariable=self.second_var, width=3)
+        sb_second.grid(row=1, column=5, sticky="w")
+
+        for col in range(6):
+            frm_datetime.columnconfigure(col, weight=1)
+
+        # Frame for action buttons
+        frm_actions = ttk.Frame(self)
+        frm_actions.pack(padx=10, pady=5, fill="x")
+
+        self.btn_backdate = ttk.Button(frm_actions, text="Backdate Selected File", command=self.on_backdate_file)
+        self.btn_backdate.pack(side="left", padx=5)
+
+        self.btn_push = ttk.Button(frm_actions, text="Push to GitHub", command=self.on_push)
+        self.btn_push.pack(side="left", padx=5)
+
+        # Disable these buttons until a repo is cloned
+        self.btn_backdate["state"] = "disabled"
+        self.btn_push["state"] = "disabled"
+
+        # Text box for logs (copy-paste friendly)
+        frm_logs = ttk.Frame(self)
+        frm_logs.pack(padx=10, pady=(0,10), fill="both", expand=True)
+
+        self.logs_text = tk.Text(
+            frm_logs, 
+            wrap="word", 
+            height=10
+        )
+        self.logs_text.pack(side="left", fill="both", expand=True)
+
+        scrollbar_logs = ttk.Scrollbar(frm_logs, orient="vertical", command=self.logs_text.yview)
+        scrollbar_logs.pack(side="right", fill="y")
+        self.logs_text.config(yscrollcommand=scrollbar_logs.set)
+
+        # Start read-only (disabled), but we can programmatically enable/disable when appending
+        self.logs_text.config(state="disabled")
+
+    def append_log(self, message):
+        """
+        Append a log message to the logs text widget, allowing easy copy-paste.
+        """
+        self.logs_text.config(state="normal")
+        self.logs_text.insert("end", message + "\n")
+        self.logs_text.see("end")  # Scroll to bottom
+        self.logs_text.config(state="disabled")
+        print(message)  # Also print to console for debugging
+
+    def on_authenticate(self):
+        token = self.github_token_var.get().strip()
+        if not token:
+            self.append_log("No token provided!")
+            return
+
+        self.append_log("Attempting authentication...")
+        try:
+            self.github_instance = Github(token)
+            user = self.github_instance.get_user()
+            self.user_repos = user.get_repos()
+
+            self.repo_listbox.delete(0, tk.END)
+            for repo in self.user_repos:
+                self.repo_listbox.insert(tk.END, repo.name)
+
+            self.append_log(f"Authenticated! Found {self.repo_listbox.size()} repositories.")
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.append_log(tb)
+            self.append_log(f"Authentication error: {e}")
+
+    def on_repo_select(self, event):
+        selection = self.repo_listbox.curselection()
+        if not selection:
+            return
+
+        # Disable commit/push while we clone
+        self.btn_backdate["state"] = "disabled"
+        self.btn_push["state"] = "disabled"
+
+        index = selection[0]
+        repo_obj = self.user_repos[index]
+
+        tmp_dir = tempfile.mkdtemp(prefix="gh-backdate-")
+        local_repo_path = os.path.join(tmp_dir, repo_obj.name)
+        self.local_clone_path = local_repo_path
+
+        self.append_log(f"Cloning {repo_obj.name} into {tmp_dir}... Please wait.")
+        self.files_listbox.delete(0, tk.END)
+
+        try:
+            clone_repo(repo_obj.clone_url, tmp_dir)
+            self.append_log("Repo cloned successfully. Listing files...")
+
+            self.repo_files = list_files_in_repo(local_repo_path)
+            for f in self.repo_files:
+                self.files_listbox.insert(tk.END, f)
+
+            if self.repo_files:
+                self.append_log(f"Loaded {len(self.repo_files)} top-level file(s).")
+            else:
+                self.append_log("No top-level files found in this repository.")
+
+            # Now that clone is done, enable commit/push
+            self.btn_backdate["state"] = "normal"
+            self.btn_push["state"] = "normal"
+
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.append_log(tb)
+            self.append_log(f"Error cloning repo: {e}")
+
+    def on_backdate_file(self):
+        if not self.local_clone_path:
+            self.append_log("No local repo cloned yet.")
+            return
+
+        selection = self.files_listbox.curselection()
+        if not selection:
+            self.append_log("No file selected to backdate.")
+            return
+
+        filename = self.files_listbox.get(selection[0])
+
+        # Gather date/time from the spinboxes
+        y = self.year_var.get()
+        m = self.month_var.get()
+        d = self.day_var.get()
+        hh = self.hour_var.get()
+        mm = self.minute_var.get()
+        ss = self.second_var.get()
+
+        # Validate date/time
+        try:
+            chosen_dt = datetime(y, m, d, hh, mm, ss)
+        except ValueError as ve:
+            self.append_log(f"Invalid date/time: {ve}")
+            return
+
+        self.append_log(f"Committing {filename} with date {chosen_dt.isoformat()} (allow-empty) ...")
+        try:
+            backdate_commit(self.local_clone_path, filename, chosen_dt)
+            self.append_log(f"Backdated commit created for {filename} ({chosen_dt.isoformat()}).")
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.append_log(tb)
+            self.append_log(f"Error committing file: {e}")
+
+    def on_push(self):
+        if not self.local_clone_path:
+            self.append_log("No local repo cloned to push.")
+            return
+
+        self.append_log("Pushing commits to GitHub... please wait.")
+        try:
+            push_commits(self.local_clone_path, branch_name="main")
+            self.append_log("Pushed commits to GitHub on 'main'.")
+        except Exception as e:
+            tb = traceback.format_exc()
+            self.append_log(tb)
+            self.append_log(f"Error pushing to GitHub: {e}")
+
+def main():
+    app = GitHubBackdateGUI()
+    app.mainloop()
+
+if __name__ == "__main__":
+    main()
